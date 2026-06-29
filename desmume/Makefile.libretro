@@ -1,4 +1,5 @@
 DEBUG=0
+EMULATORJS_THREADS ?= 0
 
 ifeq ($(platform),)
    platform = unix
@@ -211,6 +212,11 @@ else ifeq ($(platform), android)
 else ifeq ($(platform), emscripten)
    TARGET := $(TARGET_NAME)_libretro_$(platform).bc
    STATIC_LINKING = 1
+	ifeq ($(EMULATORJS_THREADS), 1)
+		LDFLAGS += -pthread
+		CFLAGS += -pthread
+		CXXFLAGS += -pthread
+	endif
 
 # Windows MSVC 2010 x64
 else ifeq ($(platform), windows_msvc2010_x64)
