@@ -1,0 +1,245 @@
+name: Build desmume2015 WASM (libretro)
+
+# ADR-0033: Self-build desmume2015 fork for NDS WASM.
+# Triggers on tags matching v* — produces a release asset containing the
+# libretro-standard _libretro.js + _libretro.wasm pair, plus a sha256 sidecar
+# and a build-info.json metadata file. LeonEmu's fetch-nds-core-prebuilt.ps1
+# pulls these via jsDelivr (cdn.jsdelivr.net/gh/bigleon2026/desmume2015@<tag>).
+#
+# Emscripten version is pinned to 3.1.46 (libretro official; see ADR-0033 D4).
+# Runner is ubuntu-22.04 (free for public repos; ADR-0033 D6).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional: override release tag (defaults to GITHUB_REF)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show upstream + fork HEAD
+        run: |
+          echo "=== fork HEAD ==="
+          git log --oneline -5
+          echo "=== upstream merge-base ==="
+          git remote -v
+          echo "GITHUB_REF=${GITHUB_REF}"
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+
+      - name: Setup Emscripten 3.1.46
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.46
+          actions-cache-folder: emsdk-cache
+
+      - name: Verify emcc version
+        run: |
+          emcc --version
+          # γ-c precheck: confirm we got 3.1.46 exactly
+          emcc --version | head -1 | grep -E 'emcc.*3\.1\.46' \
+            || { echo 'ERROR: emcc not 3.1.46 — ADR-0033 D4 violation'; exit 1; }
+
+      - name: Build desmume2015 (libretro emscripten)
+        run: |
+          cd desmume
+          # EMULATORJS_THREADS=0 (default) — single-threaded build
+          # LeonEmu serves without COOP/COEP headers; pthread would break fetch.
+          emmake make -f Makefile.libretro platform=emscripten \
+            EMULATORJS_THREADS=0 \
+            -j$(nproc)
+          echo "=== built artifacts ==="
+          ls -la *.bc *.wasm *.js 2>/dev/null || true
+          # The Makefile emits desmume2015_libretro_emscripten.bc by default;
+          # emcc post-link produces the wasm + js pair. Confirm we have the
+          # canonical libretro wasm artifact:
+          test -f desmume2015_libretro.js \
+            || test -f desmume2015_libretro_wasm \
+            || test -f desmume2015_libretro_emscripten.bc \
+            || { echo 'ERROR: no recognizable libretro artifact produced'; ls -la; exit 1; }
+
+      - name: Normalize artifact names to libretro standard
+        id: normalize
+        run: |
+          mkdir -p release
+          # The desmume2015 Makefile.libretro emscripten target may emit any
+          # of the following depending on the upstream toolchain version:
+          #   - desmume2015_libretro_emscripten.bc (pre-emcc-link)
+          #   - desmume2015_libretro.js + desmume2015_libretro.wasm (post-emcc)
+          #   - desmume2015_libretro_wasm (single-file variant)
+          # We always publish as desmume2015_libretro.js + desmume2015_libretro.wasm
+          # so LeonEmu's runtime can resolve them via CORE_WASM_ALIASES.
+          cd desmume
+          if [ -f desmume2015_libretro.js ] && [ -f desmume2015_libretro.wasm ]; then
+            echo "tool mode: separate js+wasm"
+            cp desmume2015_libretro.js ../release/
+            cp desmume2015_libretro.wasm ../release/
+          elif [ -f desmume2015_libretro_wasm ]; then
+            echo "tool mode: single-file wasm"
+            cp desmume2015_libretro_wasm ../release/desmume2015_libretro.wasm
+            echo "::warning::Build produced single-file wasm with no JS glue — \
+              emcc may need -sWASM=1 -sMODULARIZE flags in Makefile.libretro"
+          elif [ -f desmume2015_libretro_emscripten.bc ]; then
+            echo "ERROR: only .bc emitted, emcc final link did not run"
+            exit 1
+          else
+            echo "ERROR: no recognized artifact"
+            ls -la
+            exit 1
+          fi
+          cd ..
+          ls -la release/
+
+      - name: γ-a Verify WASM magic bytes
+        run: |
+          WASM=release/desmume2015_libretro.wasm
+          test -f "$WASM" || { echo "ERROR: $WASM missing"; exit 1; }
+          MAGIC=$(xxd -l 4 -p "$WASM")
+          echo "magic = $MAGIC"
+          [ "$MAGIC" = "0061736d" ] \
+            || { echo "ERROR: bad wasm magic (expected 0061736d, got $MAGIC)"; exit 1; }
+
+      - name: γ-b Verify size > WASM_STUB_MAX_BYTES (1024)
+        run: |
+          WASM=release/desmume2015_libretro.wasm
+          SIZE=$(stat -c%s "$WASM")
+          echo "size = $SIZE bytes"
+          [ "$SIZE" -gt 1024 ] \
+            || { echo "ERROR: wasm size $SIZE <= WASM_STUB_MAX_BYTES (1024) — stub or empty build"; exit 1; }
+
+      - name: γ-c Verify emcc 3.1.46 baked into wasm
+        run: |
+          WASM=release/desmume2015_libretro.wasm
+          # Emscripten embeds its version string in the wasm producers section
+          # or in linked js glue; check both.
+          if strings "$WASM" | grep -q '3\.1\.46'; then
+            echo "emcc 3.1.46 found in wasm"
+          elif [ -f release/desmume2015_libretro.js ] \
+            && grep -q '3\.1\.46' release/desmume2015_libretro.js; then
+            echo "emcc 3.1.46 found in js glue"
+          else
+            echo "ERROR: emcc 3.1.46 not found in build output"
+            strings "$WASM" | grep -E 'emscripten|clang' | head -5
+            exit 1
+          fi
+
+      - name: γ-d Verify libretro export symbols
+        run: |
+          WASM=release/desmume2015_libretro.wasm
+          # Install wasm-objdump (wabt) for export table inspection
+          sudo apt-get update -qq && sudo apt-get install -y -qq wabt
+          EXPORTS=$(wasm-objdump -x "$WASM" | grep -oE 'retro_[a-z_]+' | sort -u)
+          echo "=== libretro symbols found ==="
+          echo "$EXPORTS"
+          for sym in retro_run retro_load_game retro_get_system_info retro_init retro_deinit retro_set_environment; do
+            echo "$EXPORTS" | grep -q "^${sym}$" \
+              || { echo "ERROR: missing libretro symbol $sym"; exit 1; }
+            echo "OK: $sym"
+          done
+
+      - name: γ-e Compute SHA256 sidecar
+        run: |
+          cd release
+          ZIP_NAME=desmume2015_libretro.zip
+          # Zip as js + wasm pair (matches LeonEmu fetch-nds-core-prebuilt.ps1
+          # Expand-Archive expectations).
+          zip -j "$ZIP_NAME" desmume2015_libretro.js desmume2015_libretro.wasm
+          SHA=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
+          echo "$SHA" > "${ZIP_NAME}.sha256"
+          echo "=== sha256 ==="
+          cat "${ZIP_NAME}.sha256"
+          echo "SHA256=$SHA" >> $GITHUB_ENV
+
+      - name: γ-f Emit build-info.json
+        run: |
+          UPSTREAM_SHA=$(git rev-list --max-count=1 --before="$(git log -1 --format=%cI 06ae965~1)" HEAD 2>/dev/null || echo unknown)
+          # Build the metadata file LeonEmu's future audits will use.
+          cat > release/build-info.json <<EOF
+          {
+            "core": "desmume2015",
+            "platform": "nds",
+            "upstream_repo": "https://github.com/libretro/desmume2015",
+            "upstream_base_sha": "$(git rev-parse 06ae965~1)",
+            "fork_repo": "https://github.com/bigleon2026/desmume2015",
+            "fork_head_sha": "${GITHUB_SHA}",
+            "emscripten_version": "3.1.46",
+            "patches": [
+              {
+                "sha_local": "06ae965",
+                "ref_upstream": "EmulatorJS/desmume2015@b512e1220085ed98966a9d6a4920e4727281bdb2",
+                "description": "use -O3 instead of -O2 for emscripten platform"
+              },
+              {
+                "sha_local": "5996c2c",
+                "ref_upstream": "EmulatorJS/desmume2015@b4ae0af744cf8f7895f3586ece449f876f3142e6",
+                "description": "add optional EMULATORJS_THREADS pthread toggle"
+              }
+            ],
+            "build_options": {
+              "platform": "emscripten",
+              "EMULATORJS_THREADS": "0",
+              "parallel_jobs": "$(nproc)"
+            },
+            "wasm": {
+              "size_bytes": $(stat -c%s release/desmume2015_libretro.wasm),
+              "sha256_zip": "${SHA256}"
+            },
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "github_ref": "${GITHUB_REF}",
+            "github_run_id": "${GITHUB_RUN_ID}"
+          }
+          EOF
+          cat release/build-info.json
+
+      - name: Upload build artifacts (workflow run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: desmume2015-wasm-build
+          path: release/
+
+      - name: Create GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/desmume2015_libretro.zip
+            release/desmume2015_libretro.zip.sha256
+            release/build-info.json
+          generate_release_notes: true
+          body: |
+            ## DeSmuME 2015 libretro WASM build
+
+            **Source**: `${{ github.ref_name }}`
+            **Emscripten**: 3.1.46
+            **SHA256**: `${{ env.SHA256 }}`
+
+            ### Assets
+            - `desmume2015_libretro.zip` — js + wasm pair
+            - `desmume2015_libretro.zip.sha256` — sha256 sidecar
+            - `build-info.json` — full build metadata
+
+            ### Validation (γ checks)
+            All passed: magic bytes, size > 1024, emcc 3.1.46 baked, libretro
+            export symbols (retro_run, retro_load_game, retro_get_system_info,
+            retro_init, retro_deinit, retro_set_environment).
+
+            ### jsDelivr access
+            ```
+            https://cdn.jsdelivr.net/gh/bigleon2026/desmume2015@${{ github.ref_name }}/release/desmume2015_libretro.zip
+            ```
