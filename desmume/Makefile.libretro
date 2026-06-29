@@ -318,6 +318,8 @@ include Makefile.common
 
 ifeq ($(DEBUG), 1)
    CXXFLAGS += -O0 -g
+else ifeq ($(platform), emscripten)
+   CXXFLAGS += -O3 -DNDEBUG
 else
    CXXFLAGS += -O2 -DNDEBUG
 endif
