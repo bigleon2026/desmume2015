@@ -64,10 +64,14 @@ jobs:
           actions-cache-folder: emsdk-cache
 
       - name: Verify emcc version (γ-c precheck)
+        env:
+          EXPECTED_EMCC: ${{ env.EMSCRIPTEN_VERSION }}
         run: |
           emcc --version
-          emcc --version | head -1 | grep -E 'emcc.*$EMSCRIPTEN_VERSION' \
-            || { echo "ERROR: emcc not $EMSCRIPTEN_VERSION — ADR-0033 D4 violation"; exit 1; }
+          # bash double-quoted string so $EXPECTED_EMCC expands; escape the dots.
+          PATTERN="emcc.*$(echo "$EXPECTED_EMCC" | sed 's/\./\\./g')"
+          emcc --version | head -1 | grep -E "$PATTERN" \
+            || { echo "ERROR: emcc not $EXPECTED_EMCC — ADR-0033 D4 violation"; exit 1; }
 
       - name: Step 1 — Build desmume2015 libretro core (.bc only)
         run: |
