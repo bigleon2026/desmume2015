@@ -77,7 +77,7 @@ jobs:
         run: |
           cd desmume
           emmake make -f Makefile.libretro platform=emscripten \
-            EMULATORJS_THREADS=0 \
+            EMULATORJS_THREADS=1 \
             -j$(nproc)
           echo "=== core build artifacts ==="
           ls -la *.bc
@@ -90,13 +90,11 @@ jobs:
           # then `emmake make -f Makefile.emscripten LIBRETRO=<core>`.
           cp desmume/desmume2015_libretro_emscripten.bc RetroArch/libretro_emscripten.bc
           cd RetroArch
-          # Use the libretro-recommended no-thread, no-proxy, no-async build profile.
-          # HAVE_RWEBAUDIO=1 needed for sound. HAVE_OPENGLES=1 needed for GL drivers
-          # even though LeonEmu uses Canvas 2D — desmume2015's hw_render context is
-          # offscreen only and the wasm link still needs GLES symbols resolved.
+          # pthread + rwebaudio (no PROXY_TO_PTHREAD — incompatible with RWEBAUDIO).
+          # LeonEmu serves COOP/COEP headers so SharedArrayBuffer is available.
           emmake make -f Makefile.emscripten \
             LIBRETRO=desmume2015 \
-            HAVE_THREADS=0 \
+            HAVE_THREADS=1 \
             PROXY_TO_PTHREAD=0 \
             HAVE_RWEBAUDIO=1 \
             HAVE_AUDIOWORKLET=0 \
